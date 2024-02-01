@@ -1,0 +1,237 @@
+# based on:
+# https://securitylab.github.com/research/github-actions-preventing-pwn-requests/
+# https://github.com/thollander/actions-comment-pull-request
+
+name: "Post PR Comment from Artifact"
+description: "Post PR Comment from Artifact"
+branding:
+  icon: edit
+  color: white
+
+inputs:
+  GITHUB_TOKEN:
+    description: "Github token of the repository (automatically created by Github)"
+    default: ${{ github.token }}
+    required: true
+
+  artifact:
+    description: "Name of the artifact"
+    required: true
+    default: pr
+
+outputs:
+  id:
+    description: "ID of the comment"
+    value: ${{ steps.comment.outputs.id }}
+
+  body:
+    description: "Body of the comment"
+    value: ${{ steps.comment.outputs.body }}
+
+  html_url:
+    description: "HTML URL of the comment"
+    value: ${{ steps.comment.outputs.html_url }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: "Download artifact"
+      uses: actions/github-script@v7
+      with:
+        script: |
+          var artifacts = await github.rest.actions.listWorkflowRunArtifacts({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: ${{github.event.workflow_run.id }},
+          });
+          var matchArtifact = artifacts.data.artifacts.filter((artifact) => {
+            return artifact.name == "${{inputs.artifact}}";
+          })[0];
+          var download = await github.rest.actions.downloadArtifact({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              artifact_id: matchArtifact.id,
+              archive_format: 'zip',
+          });
+          var fs = require('fs');
+          fs.writeFileSync('${{github.workspace}}/pr.zip', Buffer.from(download.data));
+
+    - name: "Extract artifact"
+      run: |
+        mkdir -p pr
+        unzip pr.zip -d pr
+      shell: bash
+
+    - name: "Comment on PR"
+      id: comment
+      uses: actions/github-script@v7
+      with:
+        github-token: ${{ inputs.GITHUB_TOKEN }}
+        script: |
+          const fs = require("fs");
+          const removeExtension = (path) => path.split(".").slice(0, -1).join(".");
+
+          const fileName = fs.readdirSync("./pr")?.[0];
+          if (!fileName) {
+            core.setFailed("No artifact found");
+            return;
+          }
+          const issue_number = removeExtension(fileName);
+          const output = fs.readFileSync(`./pr/${fileName}`, "utf8");
+
+          async function run(issue_number, message) {
+            const REACTIONS = ['+1', '-1', 'laugh', 'confused', 'heart', 'hooray', 'rocket', 'eyes'];
+            try {
+                const comment_tag = `<!-- livecodes/thollander/actions-comment-pull-request -->`;
+                const reactions = "";
+                const mode = "upsert";
+                const create_if_not_exists = true;
+
+                if (!message) {
+                core.setFailed('"message" should be provided as input');
+                return;
+                }
+
+                let content = message;
+
+                if (!issue_number) {
+                core.setFailed(
+                    "No issue/pull request in input neither in current context.",
+                );
+                return;
+                }
+
+                async function addReactions(comment_id, reactions) {
+                const validReactions = reactions
+                    .replace(/\s/g, "")
+                    .split(",")
+                    .filter((reaction) => REACTIONS.includes(reaction));
+
+                await Promise.allSettled(
+                    validReactions.map(async (content) => {
+                    await github.rest.reactions.createForIssueComment({
+                        ...context.repo,
+                        comment_id,
+                        content,
+                    });
+                    }),
+                );
+                }
+
+                async function createComment({ owner, repo, issue_number, body }) {
+                const { data: comment } = await github.rest.issues.createComment({
+                    owner,
+                    repo,
+                    issue_number,
+                    body,
+                });
+
+                core.setOutput("id", comment.id);
+                core.setOutput("body", comment.body);
+                core.setOutput("html_url", comment.html_url);
+
+                await addReactions(comment.id, reactions);
+
+                return comment;
+                }
+
+                async function updateComment({ owner, repo, comment_id, body }) {
+                const { data: comment } = await github.rest.issues.updateComment({
+                    owner,
+                    repo,
+                    comment_id,
+                    body,
+                });
+
+                core.setOutput("id", comment.id);
+                core.setOutput("body", comment.body);
+                core.setOutput("html_url", comment.html_url);
+
+                await addReactions(comment.id, reactions);
+
+                return comment;
+                }
+
+                async function deleteComment({ owner, repo, comment_id }) {
+                const { data: comment } = await github.rest.issues.deleteComment({
+                    owner,
+                    repo,
+                    comment_id,
+                });
+
+                return comment;
+                }
+
+                const comment_tag_pattern = comment_tag;
+                const body = comment_tag_pattern
+                ? `${content}\n${comment_tag_pattern}`
+                : content;
+
+                if (comment_tag_pattern) {
+                let comment;
+                for await (const { data: comments } of github.paginate.iterator(
+                    github.rest.issues.listComments,
+                    {
+                    ...context.repo,
+                    issue_number,
+                    },
+                )) {
+                    comment = comments.find((comment) =>
+                    comment?.body?.includes(comment_tag_pattern),
+                    );
+                    if (comment) break;
+                }
+
+                if (comment) {
+                    if (mode === "upsert") {
+                    await updateComment({
+                        ...context.repo,
+                        comment_id: comment.id,
+                        body,
+                    });
+                    return;
+                    } else if (mode === "recreate") {
+                    await deleteComment({
+                        ...context.repo,
+                        comment_id: comment.id,
+                    });
+
+                    await createComment({
+                        ...context.repo,
+                        issue_number,
+                        body,
+                    });
+                    return;
+                    } else if (mode === "delete") {
+                    core.debug("Registering this comment to be deleted.");
+                    } else {
+                    core.setFailed(
+                        `Mode ${mode} is unknown. Please use 'upsert', 'recreate' or 'delete'.`,
+                    );
+                    return;
+                    }
+                } else if (create_if_not_exists) {
+                    core.info(
+                    "No comment has been found with asked pattern. Creating a new comment.",
+                    );
+                } else {
+                    core.info(
+                    "Not creating comment as the pattern has not been found. Use `create_if_not_exists: true` to create a new comment anyway.",
+                    );
+                    return;
+                }
+                }
+
+                await createComment({
+                ...context.repo,
+                issue_number,
+                body,
+                });
+            } catch (error) {
+                if (error instanceof Error) {
+                core.setFailed(error.message);
+                }
+            }
+          }
+
+          run(issue_number, output);
