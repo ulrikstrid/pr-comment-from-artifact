@@ -41,7 +41,7 @@ jobs:
 
     steps:
       - name: Post comment
-        uses: hatemhosny/gh-action-example2@main
+        uses: live-codes/pr-comment-from-artifact@v1
         with:
           GITHUB_TOKEN: ${{ github.token }}
 ```
